@@ -2,6 +2,9 @@ from tkinter import filedialog
 from math import ceil
 import math
 from matplotlib.image import imread, imsave
+from matplotlib.ticker import FuncFormatter
+import matplotlib.pyplot as plt
+from timeit import default_timer as timer
 from jinja2 import Template
 import pycuda.autoinit
 import pycuda.driver as drv
@@ -425,6 +428,7 @@ width, height, _ = img.shape
 ratio = round(width/height)
 
 root = Tk()
+root.title(chosen_file + ' ' + chosen_effect)
 left = Label(root)
 left.pack(side=LEFT)
 
@@ -438,6 +442,143 @@ left = ImgFrame(left, '/tmp/cpu_render.png')
 mid = ImgFrame(mid, chosen_file)
 right = ImgFrame(right, '/tmp/gpu_render.png')
 
-button = Button(root, text='run perf test')
+def perf_test(frames, name, cpu_renderer, gpu_renderer, img, root, output):
+    cpu_control, gpu_control = build_control(img)
+
+    cpu_total, cpu_control_total = test(frames, name, cpu_renderer, cpu_control, img)
+    gpu_total, gpu_control_total = gpu_test(frames, name, gpu_renderer, gpu_control, img)
+
+    f = open('/tmp/gpu_perf_results', 'w')
+
+    f.write(str(cpu_total) + '\n')
+    f.write(str(cpu_control_total) + '\n')
+    f.write(str(gpu_total) + '\n')
+    f.write(str(gpu_control_total) + '\n')
+
+    output.append(cpu_total)
+    output.append(cpu_control_total)
+    output.append(gpu_total)
+    output.append(gpu_control_total)
+
+    root.destroy()
+
+def test(frames, name, fn, ctrl, img):
+    fn(img)
+    start = timer()
+    for _ in range(frames):
+        result = fn(img)
+    total = timer() - start
+
+    ctrl(img)
+    start = timer()
+    for _ in range(frames):
+        result = ctrl(img)
+    control_total = timer() - start
+
+    print(name + ' cpu-test')
+    print('%f fps' % (frames / total)) # actual time
+    print('%f fps' % (frames / control_total)) # travel time
+    print('%f fps' % (frames / (total-control_total))) # theoretical best case (actual - travel)
+    return (total, control_total)
+
+def gpu_test(frames, name, fn, ctrl, img):
+    gpu_run_effect(fn, img)
+    start = timer()
+    for _ in range(frames):
+        result = gpu_run_effect(fn, img)
+    total = timer() - start
+
+    gpu_run_effect(ctrl, img)
+    start = timer()
+    for _ in range(frames):
+        result = gpu_run_effect(ctrl, img)
+    control_total = timer() - start
+
+    print(name + ' gpu-test')
+    print('%f fps' % (frames / total)) # actual time
+    print('%f fps' % (frames / control_total)) # travel time
+    print('%f fps' % (frames / (total-control_total))) # theoretical best case (actual - travel)
+    return (total, control_total)
+
+
+def build_control(img):
+    control_template = Template("""
+    __global__ void control(unsigned char *dest, unsigned char *img)
+    {
+        const int row = threadIdx.x + blockDim.x*blockIdx.x;
+        const int col = threadIdx.y + blockDim.y*blockIdx.y;
+        const int chan = threadIdx.z;
+
+        const int idx = chan + col*{{depth}} + row*{{depth}}*{{height}};
+        if (idx > {{width}}*{{height}}*{{depth}}) {
+            return;
+        }
+        dest[idx] = img[idx];
+    }
+    """)
+    width, height, depth = img.shape
+    module = SourceModule(control_template.render(width=width, height=height, depth=depth))
+
+    gpu_brighten = module.get_function("control")
+    block = (8,8,3)
+    grid = (ceil(width/8), ceil(height/8))
+
+    gpu_control = (gpu_brighten, block, grid)
+
+    def vectorized_control(px):
+        return px
+
+    cpu_control = numpy.vectorize(vectorized_control)
+
+    return (cpu_control, gpu_control)
+
+
+frames = 100
+results = list()
+name = chosen_effect + ' ' + chosen_file
+button = Button(root, text='run perf test', command=lambda: perf_test(frames, name,cpu_renderer, gpu_renderer, img, root, results))
 button.pack(side=BOTTOM)
 root.mainloop()
+
+if len(results) == 0:
+    exit()
+
+def fps_calc(total, control_total):
+    fps = frames/total
+    control_fps = frames/control_total
+    best_fps = frames/(total-control_total)
+
+    return (fps, control_fps, best_fps)
+
+cpu_fps, cpu_control_fps, cpu_best_fps = fps_calc(results[0], results[1])
+gpu_fps, gpu_control_fps, gpu_best_fps = fps_calc(results[2], results[3])
+
+
+fps_stats = [cpu_fps, cpu_control_fps, gpu_fps, gpu_control_fps]
+
+
+def fps_formatter(x, pos):
+    return '%1.0f FPS' % x
+
+
+formatter = FuncFormatter(fps_formatter)
+x = numpy.arange(4)
+
+
+_, axs = plt.subplots(nrows=1, ncols=2, sharex=True)
+ax = axs[0]
+ax.yaxis.set_major_formatter(formatter)
+ax.set_ylabel('FPS linear scale')
+ax.bar(x, fps_stats)
+plt.xticks(x, ('CPU', 'CPU CTRL', 'GPU', 'GPU CTRL'))
+
+ax = axs[1]
+ax.set_yscale("log", nonposy='clip')
+ax.set_ylabel('FPS logarithmic scale')
+ax.bar(x, fps_stats)
+
+fig = plt.gcf()
+fig.canvas.set_window_title(name)
+plt.tight_layout()
+plt.show()
+
