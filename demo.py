@@ -8,22 +8,90 @@ import pycuda.driver as drv
 import numpy
 from pycuda.compiler import SourceModule
 from tkinter import *
-from tkinter import *
 from PIL import Image, ImageTk
 
-chosen_file = '/home/data/Pictures/fox-small.jpg'
-chosen_effect = "Gamma 2.0"
+
+def test_chiaroscuro(img):
+    return(cpu_chiaroscuro, gpu_chiaroscuro(img))
+
+
+def cpu_chiaroscuro(img):
+    result = numpy.zeros_like(img)
+    height, width, depth = img.shape
+    for row in range(height):
+        for col in range(width):
+            r = img[row,col, 0] / 255.0
+            g = img[row,col, 1] / 255.0
+            b = img[row,col, 2] / 255.0
+
+            intensity = 0.21*r + 0.72*g + 0.7*b
+            if intensity == 0.0:
+                intensity = 1.0
+
+            r = math.pow(r, 1.0/intensity)
+            g = math.pow(g, 1.0/intensity)
+            b = math.pow(b, 1.0/intensity)
+
+            result[row, col, 0] = round(r * 255.0)
+            result[row, col, 1] = round(g * 255.0)
+            result[row, col, 2] = round(b * 255.0)
+
+    return result
+
+def gpu_chiaroscuro(img):
+    template = Template("""
+    __global__ void chiaroscuro(unsigned char *dest, unsigned char *img) {
+        const int row = threadIdx.x + blockDim.x*blockIdx.x;
+        const int col = threadIdx.y + blockDim.y*blockIdx.y;
+
+        const int idx = col*{{depth}} + row*{{depth}}*{{height}};
+
+        if (idx+2 > {{width}}*{{height}}*{{depth}}) {
+            return;
+        }
+
+        const float r = img[idx] / 255.0f;
+        const float g = img[idx+1] / 255.0f;
+        const float b = img[idx+2] / 255.0f;
+
+        float intensity = 0.21f*r + 0.72*g + 0.07*b;
+        if (intensity == 0.0f) {
+            intensity = 1.0f;
+        }
+
+        const float out_r = __powf(r, 1.0f/intensity);
+        const float out_g = __powf(g, 1.0f/intensity);
+        const float out_b = __powf(b, 1.0f/intensity);
+
+        dest[idx] = __float2int_rn(out_r*255.0f);
+        dest[idx+1] = __float2int_rn(out_g*255.0f);
+        dest[idx+2] = __float2int_rn(out_b*255.0f);
+    }
+    """)
+
+    width, height, depth = img.shape
+    module = SourceModule(template.render(width=width, height=height, depth=depth))
+    gpu_brighten = module.get_function("chiaroscuro")
+
+    block = (8,8,1)
+    grid = (ceil(width/8), ceil(height/8))
+    return (gpu_brighten, block, grid)
+
+
+def gpu_run_effect(gpu_instructions, img):
+    effect, block, grid = gpu_instructions
+    dest = numpy.zeros_like(img)
+    effect(drv.Out(dest), drv.In(img), block=block, grid=grid)
+    return dest
+
 
 def test_gamma_half(img):
-    return(cpu_gamma_half(img), gpu_gamma_half(img))
+    return(cpu_gamma_half, gpu_gamma_half(img))
 
 def gamma_half(px):
     px = px / 255;
     corrected = math.pow(px, 0.5)
-    if px > 1.0:
-        px = 1.0
-    if px < 0.0:
-        px = 0.0
+
     corrected *= 255.0
     return round(corrected)
 
@@ -33,7 +101,7 @@ def cpu_gamma_half(img):
 
 def gpu_gamma_half(img):
     template = Template("""
-    __global__ void gamma_two(unsigned char *dest, unsigned char *img) {
+    __global__ void gamma_half(unsigned char *dest, unsigned char *img) {
         const int row = threadIdx.x + blockDim.x*blockIdx.x;
         const int col = threadIdx.y + blockDim.y*blockIdx.y;
         const int chan = threadIdx.z;
@@ -47,13 +115,6 @@ def gpu_gamma_half(img):
         const float px = img[idx] / 255.0f;
         float out = __powf(px, 0.5f);
 
-        if (out > 1.0f){
-            out = 1.0f;
-        }
-        if (out < 0.0f) {
-            out = 0.0f;
-        }
-
         dest[idx] = __float2int_rn(out*255.0f);
     }
     """)
@@ -63,15 +124,16 @@ def gpu_gamma_half(img):
 
     dest = numpy.zeros_like(img)
 
-    gpu_brighten = module.get_function("gamma_two")
-    gpu_brighten(drv.Out(dest), drv.In(img), block=(8,8,3), grid=(ceil(width/8), ceil(height/8)))
+    gpu_brighten = module.get_function("gamma_half")
 
-    return dest
+    block = (8,8,3)
+    grid = (ceil(width/8), ceil(height/8))
+    return (gpu_brighten, block, grid)
 
 
 
 def test_gamma_two(img):
-    return(cpu_gamma_two(img), gpu_gamma_two(img))
+    return(cpu_gamma_two, gpu_gamma_two(img))
 
 def gamma_two(px):
     px = px / 255;
@@ -103,13 +165,6 @@ def gpu_gamma_two(img):
         const float px = img[idx] / 255.0f;
         float out = __powf(px, 2);
 
-        if (out > 1.0f){
-            out = 1.0f;
-        }
-        if (out < 0.0f) {
-            out = 0.0f;
-        }
-
         dest[idx] = __float2int_rn(out*255.0f);
     }
     """)
@@ -120,12 +175,12 @@ def gpu_gamma_two(img):
     dest = numpy.zeros_like(img)
 
     gpu_brighten = module.get_function("gamma_two")
-    gpu_brighten(drv.Out(dest), drv.In(img), block=(8,8,3), grid=(ceil(width/8), ceil(height/8)))
-
-    return dest
+    block = (8,8,3)
+    grid = (ceil(width/8), ceil(height/8))
+    return (gpu_brighten, block, grid)
 
 def test_brighten(img):
-    return (cpu_brighten(img), gpu_brighten(img))
+    return (cpu_brighten, gpu_brighten(img))
 
 def cpu_brighten(img):
     fn = numpy.vectorize(brighten_vectorized)
@@ -165,14 +220,18 @@ def gpu_brighten(img):
     dest = numpy.zeros_like(img)
 
     gpu_brighten = module.get_function("brighten")
-    gpu_brighten(drv.Out(dest), drv.In(img), block=(8,8,3), grid=(ceil(width/8), ceil(height/8)))
-
-    return dest
+    block = (8,8,3)
+    grid = (ceil(width/8), ceil(height/8))
+    return (gpu_brighten, block, grid)
 
 
 def brighten_vectorized(px):
     temp = px * 2
     return clamp(0, 255, temp)
+
+
+def test_edge_detection(img):
+    return (edge_detect, gpu_edge_detect(img))
 
 def edge_detect(img):
     result = numpy.zeros_like(img)
@@ -261,9 +320,9 @@ def gpu_edge_detect(img):
 
     dest = numpy.zeros_like(img)
     gpu_brighten = module.get_function("edge")
-    gpu_brighten(drv.Out(dest), drv.In(img), block=(8,8,1), grid=(ceil(width/8), ceil(height/8)))
-
-    return dest
+    block = (8,8,1)
+    grid = (ceil(width/8), ceil(height/8))
+    return (gpu_brighten, block, grid)
 
 
 def clamp(low, high, val):
@@ -273,33 +332,70 @@ def clamp(low, high, val):
         return high
     return val
 
-def test_edge_detection(img):
-    return (edge_detect(img), gpu_edge_detect(img))
-
+chosen_file = ""
+chosen_effect = ""
 
 switch = {
     'Edge Detection': test_edge_detection,
     'Brighten x2': test_brighten,
     'Gamma 2.0': test_gamma_two,
     'Gamma 0.5': test_gamma_half,
+    'Chiaroscuro': test_chiaroscuro,
 }
+
+###############################################################################################
+## UI
+###############################################################################################
+root = Tk()
+root.filename =  filedialog.askopenfilename(initialdir = "/",title = "Select file",filetypes = (("jpeg files","*.jpg"),("png files","*.png"),("all files","*.*")))
+
+root.title("Select an effect to apply")
+
+# Add a grid
+mainframe = Frame(root)
+mainframe.grid(column=0,row=0, sticky=(N,W,E,S) )
+mainframe.columnconfigure(0, weight = 1)
+mainframe.rowconfigure(0, weight = 1)
+mainframe.pack(pady = 100, padx = 100)
+
+# Create a Tkinter variable
+tkvar = StringVar(root)
+
+# Dictionary with options
+choices = list(switch.keys())
+tkvar.set('Select an effect...') # set the default option
+
+popupMenu = OptionMenu(mainframe, tkvar, *choices)
+Label(mainframe, text="Choose a dish").grid(row = 1, column = 1)
+popupMenu.grid(row = 2, column =1)
+
+# on change dropdown value
+def change_dropdown(*args):
+    root.chosen_effect = tkvar.get()
+    root.destroy()
+
+# link function to change dropdown
+tkvar.trace('w', change_dropdown)
+
+root.mainloop()
+
+chosen_file = root.filename
+chosen_effect = root.chosen_effect
 
 
 img = imread(chosen_file)
 
-print(img.shape)
-cpu_render, gpu_render = switch[chosen_effect](img)
-imsave('/tmp/cpu_render.png', cpu_render)
-imsave('/tmp/gpu_render.png', gpu_render)
-
+cpu_renderer, gpu_renderer = switch[chosen_effect](img)
+imsave('/tmp/cpu_render.png', cpu_renderer(img))
+imsave('/tmp/gpu_render.png', gpu_run_effect(gpu_renderer, img))
 
 
 class ImgFrame(Frame):
-    def __init__(self, master):
+    def __init__(self, master, path):
         Frame.__init__(self, master)
         self.columnconfigure(0,weight=1)
         self.rowconfigure(0,weight=1)
-        self.original = Image.open('/tmp/gpu_render.png')
+        self.original = Image.open(path)
         self.image = ImageTk.PhotoImage(self.original)
         self.display = Canvas(self, bd=0, highlightthickness=0)
         self.display.create_image(0, 0, image=self.image, anchor=NW, tags="IMG")
@@ -323,6 +419,25 @@ class ImgFrame(Frame):
         self.display.delete("IMG")
         self.display.create_image(0, 0, image=self.image, anchor=NW, tags="IMG")
 
+
+width, height, _ = img.shape
+
+ratio = round(width/height)
+
 root = Tk()
-app = ImgFrame(root)
-app.mainloop()
+left = Label(root)
+left.pack(side=LEFT)
+
+mid = Label(root)
+mid.pack(side=LEFT)
+
+right = Label(root)
+right.pack(side=LEFT)
+
+left = ImgFrame(left, '/tmp/cpu_render.png')
+mid = ImgFrame(mid, chosen_file)
+right = ImgFrame(right, '/tmp/gpu_render.png')
+
+button = Button(root, text='run perf test')
+button.pack(side=BOTTOM)
+root.mainloop()
