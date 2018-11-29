@@ -15,7 +15,7 @@ multiply_them = mod.get_function("multiply_them")
 
 a = numpy.random.randn(400).astype(numpy.float32)
 b = numpy.random.randn(400).astype(numpy.float32)
-
+print(a)
 dest = numpy.zeros_like(a)
 multiply_them(
         drv.Out(dest), drv.In(a), drv.In(b),
